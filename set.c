@@ -16,7 +16,7 @@ void set_create(set *stk, int size) {
     }
 }
 
-int set_has(set *stk, short item) {
+int set_has(set *stk, unsigned short item) {
     int index = item % stk->size;
     for (int i = 0; i < stk->counts[index]; ++i) {
         if (stk->items[index][i] == item)
@@ -25,7 +25,7 @@ int set_has(set *stk, short item) {
     return 0;
 }
 
-int set_add(set *stk, short item) {
+int set_add(set *stk, unsigned short item) {
     if (set_has(stk, item))
         return 1;
     int index = item % stk->size;
