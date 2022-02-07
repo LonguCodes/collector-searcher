@@ -15,10 +15,10 @@
 #include "number_parser.h"
 #include "number_record.h"
 #include "set.h"
+#include "throw_exception.h"
 
 #define BUF_SIZE 16384
 #define SHORT_MAX 65536
-
 
 #define E_INPUT_FILE 1
 #define E_FCNTL 2
@@ -26,6 +26,11 @@
 #define E_WRITE_PIPE 4
 #define E_LOG_FILE 5
 #define E_RESULT_FILE 6
+#define E_DUP 7
+#define E_PIPE 8
+#define E_FORK 9
+#define E_EXEC 9
+
 
 
 int current_children_count = 0;
@@ -43,21 +48,14 @@ ll min(ll a, ll b) {
 }
 
 void write_result_file(int number, pid_t pid) {
-    lseek(result_file, number * sizeof(pid_t), SEEK_SET);
+    throw_exception(lseek(result_file, number * sizeof(pid_t), SEEK_SET), E_RESULT_FILE);
     pid_t current;
-    if (read(result_file, &current, sizeof(pid_t)) < 0) {
-        perror(NULL);
-        exit(E_LOG_FILE);
-    }
+    throw_exception(read(result_file, &current, sizeof(pid_t)), E_RESULT_FILE);
     if (current != 0)
         return;
 
-    lseek(result_file, number * sizeof(pid_t), SEEK_SET);
-
-    if (write(result_file, &pid, sizeof(pid_t)) < 0) {
-        perror(NULL);
-        exit(E_LOG_FILE);
-    }
+    throw_exception(lseek(result_file, number * sizeof(pid_t), SEEK_SET), E_RESULT_FILE);
+    throw_exception(write(result_file, &pid, sizeof(pid_t)), E_RESULT_FILE);
 }
 
 void log_child_update(char *status, int pid) {
@@ -65,11 +63,7 @@ void log_child_update(char *status, int pid) {
     struct timespec time;
     clock_gettime(CLOCK_MONOTONIC, &time);
     sprintf(log_buff, "%lld.%.9ld, %s, %d\n", (ll) time.tv_sec, time.tv_nsec, status, pid);
-
-    if (write(log_file, log_buff, strlen(log_buff)) < 0) {
-        perror(NULL);
-        exit(E_LOG_FILE);
-    }
+    throw_exception(write(log_file, log_buff, strlen(log_buff)), E_LOG_FILE);
 }
 
 int check_dead_children() {
@@ -84,18 +78,15 @@ int check_dead_children() {
 
         any_died = 1;
         current_children_count--;
-        if (WEXITSTATUS(status) > 10 || set_count(&found_numbers)  > SHORT_MAX * 0.75)
+        if (WEXITSTATUS(status) > 10 || set_count(&found_numbers) > SHORT_MAX * 0.75)
             max_number_of_children--;
     }
     return any_died;
 }
 
 void create_child(int pipeIn[2], int pipeOut[2], char *to_process_per_child) {
-    int fork_result = fork();
-    if (fork_result < 0) {
-        perror(NULL);
-        exit(9);
-    }
+    int fork_result = (int) throw_exception(fork(), E_FORK);
+
     if (fork_result) {
         current_children_count++;
         log_child_update("CREATE", fork_result);
@@ -108,15 +99,9 @@ void create_child(int pipeIn[2], int pipeOut[2], char *to_process_per_child) {
     args[2] = NULL;
 
 
-    dup2(pipeIn[0], 0);
-    dup2(pipeOut[1], 1);
-
-    int exec_result = execv("searcher", args);
-    if (exec_result != 0) {
-        perror(NULL);
-        exit(10);
-    }
-
+    throw_exception(dup2(pipeIn[0], 0), E_DUP);
+    throw_exception(dup2(pipeOut[1], 1), E_DUP);
+    throw_exception(execv("searcher", args), E_EXEC);
 }
 
 int main(int argc, char *argv[]) {
@@ -152,45 +137,23 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    int input_file = open(input_file_path, O_RDONLY);
-    if (input_file == -1) {
-        perror(NULL);
-        return E_INPUT_FILE;
-    }
-    log_file = open(log_file_path, O_WRONLY | O_CREAT | O_APPEND);
-    if (log_file == -1) {
-        perror(NULL);
-        return E_LOG_FILE;
-    }
-
-    result_file = open(result_file_path, O_RDWR | O_CREAT | O_TRUNC);
-    if (result_file == -1) {
-        perror(NULL);
-        return E_RESULT_FILE;
-    }
+    int input_file = (int) throw_exception(open(input_file_path, O_RDONLY), E_INPUT_FILE);
+    log_file = (int) throw_exception(open(log_file_path, O_WRONLY | O_CREAT | O_APPEND), E_LOG_FILE);
+    result_file = (int) throw_exception(open(result_file_path, O_RDWR | O_CREAT | O_TRUNC), E_RESULT_FILE);
 
     pid_t empty[65536] = {0};
-    write(result_file, empty, sizeof(empty));
+    throw_exception(write(result_file, empty, sizeof(empty)), E_RESULT_FILE);
 
     set_create(&found_numbers, 1024);
 
     int pipeIn[2];
     int pipeOut[2];
 
-    pipe(pipeIn);
-    pipe(pipeOut);
+    throw_exception(pipe(pipeIn), E_PIPE);
+    throw_exception(pipe(pipeOut), E_PIPE);
 
-    int result = fcntl(pipeOut[0], F_SETFL, O_NONBLOCK);
-    if (result < 0) {
-        perror(NULL);
-        return E_FCNTL;
-    }
-
-    result = fcntl(pipeIn[1], F_SETFL, O_NONBLOCK);
-    if (result < 0) {
-        perror(NULL);
-        return E_FCNTL;
-    }
+    throw_exception(fcntl(pipeOut[0], F_SETFL, O_NONBLOCK), E_FCNTL);
+    throw_exception(fcntl(pipeIn[1], F_SETFL, O_NONBLOCK), E_FCNTL);
 
     char buffer[BUF_SIZE];
     int write_result = BUF_SIZE;
@@ -212,14 +175,10 @@ int main(int argc, char *argv[]) {
 
         if (write_result == BUF_SIZE && yet_to_load > 0) {
 
-            size_t file_read_result = read(input_file, buffer, min(BUF_SIZE, yet_to_load));
-            if (file_read_result < 0) {
-                perror(NULL);
-                return E_READ_FILE;
-            }
+            size_t file_read_result = throw_exception(read(input_file, buffer, min(BUF_SIZE, yet_to_load)),
+                                                      E_READ_FILE);
             yet_to_load -= (int) file_read_result;
             yet_to_load = yet_to_load > 0 ? yet_to_load : 0;
-
 
             write_result = 0;
         }
