@@ -30,7 +30,8 @@
 #define E_PIPE 8
 #define E_FORK 9
 #define E_EXEC 9
-
+#define E_SETPGID 10
+#define E_SIGNAL 11
 
 
 int current_children_count = 0;
@@ -46,6 +47,7 @@ int result_file = -1;
 ll min(ll a, ll b) {
     return a < b ? a : b;
 }
+
 
 void write_result_file(int number, pid_t pid) {
     throw_exception(lseek(result_file, number * sizeof(pid_t), SEEK_SET), E_RESULT_FILE);
@@ -63,6 +65,7 @@ void log_child_update(char *status, int pid) {
     struct timespec time;
     clock_gettime(CLOCK_MONOTONIC, &time);
     sprintf(log_buff, "%lld.%.9ld, %s, %d\n", (ll) time.tv_sec, time.tv_nsec, status, pid);
+
     throw_exception(write(log_file, log_buff, strlen(log_buff)), E_LOG_FILE);
 }
 
@@ -75,18 +78,17 @@ int check_dead_children() {
             continue;
 
         log_child_update("DIE", pid);
-
         any_died = 1;
         current_children_count--;
-        if (WEXITSTATUS(status) > 10 || set_count(&found_numbers) > SHORT_MAX * 0.75)
+        if (WEXITSTATUS(status) > 10 || set_count(&found_numbers) > SHORT_MAX * 0.75){
             max_number_of_children--;
+        }
     }
     return any_died;
 }
 
 void create_child(int pipeIn[2], int pipeOut[2], char *to_process_per_child) {
     int fork_result = (int) throw_exception(fork(), E_FORK);
-
     if (fork_result) {
         current_children_count++;
         log_child_update("CREATE", fork_result);
@@ -99,10 +101,12 @@ void create_child(int pipeIn[2], int pipeOut[2], char *to_process_per_child) {
     args[2] = NULL;
 
 
+    throw_exception(setpgid(getpid(), getppid()), E_SETPGID);
     throw_exception(dup2(pipeIn[0], 0), E_DUP);
     throw_exception(dup2(pipeOut[1], 1), E_DUP);
     throw_exception(execv("searcher", args), E_EXEC);
 }
+
 
 int main(int argc, char *argv[]) {
 
@@ -116,7 +120,7 @@ int main(int argc, char *argv[]) {
                 break;
             case 's':
                 to_load = parse_number(optarg);
-                yet_to_load = to_load;
+                yet_to_load = to_load * 2;
                 break;
             case 'w':
                 to_process_per_child = optarg;
@@ -138,8 +142,8 @@ int main(int argc, char *argv[]) {
     }
 
     int input_file = (int) throw_exception(open(input_file_path, O_RDONLY), E_INPUT_FILE);
-    log_file = (int) throw_exception(open(log_file_path, O_WRONLY | O_CREAT | O_APPEND), E_LOG_FILE);
-    result_file = (int) throw_exception(open(result_file_path, O_RDWR | O_CREAT | O_TRUNC), E_RESULT_FILE);
+    log_file = (int) throw_exception(open(log_file_path, O_WRONLY | O_CREAT | O_APPEND, 0666), E_LOG_FILE);
+    result_file = (int) throw_exception(open(result_file_path, O_RDWR | O_CREAT | O_TRUNC, 0666), E_RESULT_FILE);
 
     pid_t empty[65536] = {0};
     throw_exception(write(result_file, empty, sizeof(empty)), E_RESULT_FILE);
@@ -156,7 +160,8 @@ int main(int argc, char *argv[]) {
     throw_exception(fcntl(pipeIn[1], F_SETFL, O_NONBLOCK), E_FCNTL);
 
     char buffer[BUF_SIZE];
-    int write_result = BUF_SIZE;
+    int already_written = BUF_SIZE;
+    int current_buffer_size = 0;
 
     number_record record;
 
@@ -164,7 +169,10 @@ int main(int argc, char *argv[]) {
     to_wait.tv_sec = 0;
     to_wait.tv_nsec = 48e+7l;
 
+    setpgid(getpid(), getpid());
+
     signal(SIGCHLD, NULL);
+
 
     while (max_number_of_children > 0) {
 
@@ -173,24 +181,26 @@ int main(int argc, char *argv[]) {
             create_child(pipeIn, pipeOut, to_process_per_child);
         }
 
-        if (write_result == BUF_SIZE && yet_to_load > 0) {
+        if (already_written == BUF_SIZE && yet_to_load > 0) {
 
-            size_t file_read_result = throw_exception(read(input_file, buffer, min(BUF_SIZE, yet_to_load)),
-                                                      E_READ_FILE);
-            yet_to_load -= (int) file_read_result;
+            current_buffer_size = (int) throw_exception(read(input_file, buffer, min(BUF_SIZE, yet_to_load)),
+                                                        E_READ_FILE);
+            yet_to_load -= (int) current_buffer_size;
             yet_to_load = yet_to_load > 0 ? yet_to_load : 0;
 
-            write_result = 0;
+            already_written = 0;
         }
-
-        int res = (int) write(pipeIn[1], buffer + write_result, BUF_SIZE - write_result);
-        if (res < 0 && errno != EAGAIN) {
-            perror(NULL);
-            return E_WRITE_PIPE;
+        if (yet_to_load || already_written != BUF_SIZE) {
+            int write_result = (int) write(pipeIn[1], buffer + already_written, min(BUF_SIZE - already_written, current_buffer_size));
+            if (write_result < 0 && errno != EAGAIN) {
+                perror(NULL);
+                return E_WRITE_PIPE;
+            }
+            if (write_result > 0) {
+                already_written += write_result;
+                current_buffer_size -= write_result;
+            }
         }
-        if (res > 0)
-            write_result += res;
-
 
         while (read(pipeOut[0], &record, sizeof(record)) > 0) {
             any_read = 1;
@@ -200,11 +210,35 @@ int main(int argc, char *argv[]) {
 
         int any_died = check_dead_children();
         if (!any_read && !any_died) {
+
+            struct pollfd pipeCheck;
+            pipeCheck.events = POLLIN;
+            pipeCheck.fd = pipeIn[0];
+            throw_exception(poll(&pipeCheck, 1, 0), 1);
+
             printf("Nothing happened, sleeping...\n");
             nanosleep(&to_wait, NULL);
         }
 
-        if (yet_to_load == 0 && !poll(&(struct pollfd) {.fd = pipeIn[0], .events = POLLIN}, 1, 0))
+        // https://stackoverflow.com/questions/13811614/how-to-see-if-a-pipe-is-empty
+
+        struct pollfd pipeCheckIn;
+        pipeCheckIn.events = POLLIN;
+        pipeCheckIn.fd = pipeIn[0];
+        throw_exception(poll(&pipeCheckIn, 1, 0), 1);
+
+        struct pollfd pipeCheckOut;
+        pipeCheckOut.events = POLLIN;
+        pipeCheckOut.fd = pipeOut[0];
+        throw_exception(poll(&pipeCheckOut, 1, 0), 1);
+        if (yet_to_load == 0 && !(pipeCheckIn.revents & POLLIN) && !(pipeCheckOut.revents & POLLIN))
             break;
     }
+    signal(SIGUSR1, SIG_IGN);
+    killpg(getpid(), SIGUSR1);
+    while (current_children_count > 0) {
+        check_dead_children();
+        sleep(1);
+    }
+
 }
